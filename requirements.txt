@@ -1,0 +1,16 @@
+# Core ML
+torch>=2.0.0
+transformers>=4.40.0
+datasets>=2.18.0
+accelerate>=0.28.0
+
+# Data
+pandas>=2.0.0
+numpy>=1.26.0
+scikit-learn>=1.3.0
+
+# AI rewriting (optional, only needed for STEP 2)
+openai>=1.0.0
+
+# Utilities
+tqdm>=4.66.0

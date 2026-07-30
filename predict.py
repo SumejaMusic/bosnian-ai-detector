@@ -1,17 +1,32 @@
 """
 Inference & External Validation — Bosnian AI Text Detector
 
+Aligned with the new data pipeline:
+  - accepts CSV files OR raw <***> .txt dumps (buka.ba format) as input
+  - applies the SAME text cleaning as training (clean_text from data_preparation)
+  - uses the 'year' column from the data when present (falls back to filename)
+  - per-source AND per-category breakdown (like Table 5 of the Turkish paper)
+  - prediction columns are prefixed pred_* so they never overwrite dataset labels
+
 Usage:
     # Single article
-    python predict.py --text "Predsjednik je danas izjavio..." --model_dir output/final_model
+    python predict.py --model_dir output/final_model text --text "Predsjednik je danas izjavio..."
 
-    # Batch CSV (for external validation across multiple years)
-    python predict.py --input_csv data/external/2023_articles.csv \
-                      --output_csv results/2023_predictions.csv \
-                      --model_dir output/final_model
+    # Batch CSV
+    python predict.py --model_dir output/final_model batch \
+        --input_csv data/external/buka_recent.csv --output_csv results/buka_pred.csv
 
-    # Yearly analysis
-    python predict.py --input_dir data/external/ --model_dir output/final_model
+    # Batch raw .txt dump (buka.ba format, parsed on the fly)
+    python predict.py --model_dir output/final_model batch \
+        --input_txt "BiHSviClanciPrviDio.txt" --output_csv results/bih_pred.csv
+
+    # Yearly analysis over a directory of CSVs (uses 'year' column if present)
+    python predict.py --model_dir output/final_model yearly \
+        --input_dir data/external/ --output_dir results/yearly
+
+    # Yearly analysis directly on the buka.ba folder structure
+    python predict.py --model_dir output/final_model buka \
+        --buka_dir "/content/drive/MyDrive/buka.ba" --output_dir results/buka
 """
 
 import json
@@ -25,19 +40,23 @@ import torch
 from torch.nn.functional import softmax
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
+from data_preparation import clean_text
+from parse_raw_articles import parse_dump_file, build_dataframe
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 LABEL_NAMES = {0: "Human-written", 1: "AI-generated/rewritten"}
+PRED_COLUMNS = ["pred_label", "pred_label_name", "prob_human", "prob_ai", "confidence"]
 
 
 # ---------------------------------------------------------------------------
 # Predictor class
 # ---------------------------------------------------------------------------
-class BosniakAIDetector:
+class BosnianAIDetector:
     """
     Loads the fine-tuned BERTić model and predicts whether
-    a Bosnian news article is human-written or AI-generated.
+    a Bosnian news article is human-written or AI-generated/rewritten.
     """
 
     def __init__(self, model_dir: str, device: str = "auto", max_length: int = 512):
@@ -54,15 +73,27 @@ class BosniakAIDetector:
         self.model.eval()
         logger.info("Model ready.")
 
-    def predict(self, texts: list[str], batch_size: int = 16) -> list[dict]:
+    def predict(
+        self,
+        texts: list[str],
+        batch_size: int = 16,
+        clean: bool = True,
+    ) -> list[dict]:
         """
         Predict for a list of texts.
+
+        clean=True applies the same clean_text() used during training —
+        keep this on unless texts were already cleaned, otherwise the
+        input distribution won't match what the model saw in training.
+
         Returns: list of dicts with keys:
-            label (int), label_name (str), confidence (float),
+            pred_label (int), pred_label_name (str), confidence (float),
             prob_human (float), prob_ai (float)
         """
-        all_results = []
+        if clean:
+            texts = [clean_text(t) for t in texts]
 
+        all_results = []
         for start in range(0, len(texts), batch_size):
             batch_texts = texts[start : start + batch_size]
             inputs = self.tokenizer(
@@ -81,11 +112,11 @@ class BosniakAIDetector:
             for prob in probs:
                 label = int(np.argmax(prob))
                 all_results.append({
-                    "label":       label,
-                    "label_name":  LABEL_NAMES[label],
-                    "prob_human":  float(prob[0]),
-                    "prob_ai":     float(prob[1]),
-                    "confidence":  float(np.max(prob)),
+                    "pred_label":      label,
+                    "pred_label_name": LABEL_NAMES[label],
+                    "prob_human":      float(prob[0]),
+                    "prob_ai":         float(prob[1]),
+                    "confidence":      float(np.max(prob)),
                 })
 
         return all_results
@@ -93,71 +124,145 @@ class BosniakAIDetector:
     def predict_single(self, text: str) -> dict:
         return self.predict([text])[0]
 
+    def predict_dataframe(self, df: pd.DataFrame, text_col: str = "text",
+                          batch_size: int = 16) -> pd.DataFrame:
+        """Attach pred_* columns to a DataFrame."""
+        results = self.predict(df[text_col].fillna("").tolist(), batch_size=batch_size)
+        for key in PRED_COLUMNS:
+            df[key] = [r[key] for r in results]
+        return df
+
 
 # ---------------------------------------------------------------------------
-# External validation — yearly analysis
+# Aggregation — summary tables like Table 5 of the Turkish paper
+# ---------------------------------------------------------------------------
+def summarize_predictions(
+    df: pd.DataFrame,
+    group_cols: list[str],
+) -> pd.DataFrame:
+    """
+    Aggregate predictions by the given columns (e.g. ['year', 'source'] or
+    ['year', 'category']). Missing group columns are skipped automatically.
+    """
+    group_cols = [c for c in group_cols if c in df.columns]
+    if not group_cols:
+        group_cols = ["_all"]
+        df = df.assign(_all="all")
+
+    rows = []
+    for keys, sub in df.groupby(group_cols, dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        n_total = len(sub)
+        n_ai = int((sub["pred_label"] == 1).sum())
+        rows.append({
+            **dict(zip(group_cols, keys)),
+            "n_articles":    n_total,
+            "human_pct":     round(100 * (1 - n_ai / n_total), 1),
+            "ai_pct":        round(100 * n_ai / n_total, 1),
+            "mean_conf_pct": round(100 * sub["confidence"].mean(), 1),
+        })
+    return pd.DataFrame(rows).sort_values(group_cols).reset_index(drop=True)
+
+
+def save_summaries(df: pd.DataFrame, output_dir: str) -> None:
+    """Save per-year/source and per-year/category summaries + full predictions."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    df.to_csv(out / "predictions_full.csv", index=False)
+
+    summaries = {
+        "summary_by_year_source":   ["year", "source"],
+        "summary_by_year_category": ["year", "category"],
+        "summary_by_year":          ["year"],
+    }
+    for name, cols in summaries.items():
+        available = [c for c in cols if c in df.columns]
+        if not available:
+            continue
+        s = summarize_predictions(df, available)
+        s.to_csv(out / f"{name}.csv", index=False)
+        logger.info(f"\n{name}:\n{s.to_string(index=False)}")
+
+    logger.info(f"\nAll results saved to {out}/")
+
+
+# ---------------------------------------------------------------------------
+# External validation modes
 # ---------------------------------------------------------------------------
 def analyze_yearly_distribution(
-    detector: BosniakAIDetector,
+    detector: BosnianAIDetector,
     input_dir: str,
     output_dir: str,
     batch_size: int = 16,
 ):
     """
     Apply detector to all CSV files in input_dir.
-    Files should be named like: 2023_articles.csv, 2024_articles.csv, etc.
-    Each CSV must have a 'text' column and optionally 'source'.
-    Produces a summary table as in Table 5 of the Turkish paper.
+    Year is taken from the 'year' column when present; otherwise from the
+    filename prefix (e.g. 2023_articles.csv → 2023).
     """
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    yearly_summary = []
-
+    all_dfs = []
     for csv_path in sorted(Path(input_dir).glob("*.csv")):
-        year = csv_path.stem.split("_")[0]
         df = pd.read_csv(csv_path)
         logger.info(f"Processing {csv_path.name}: {len(df)} articles")
 
-        results = detector.predict(df["text"].fillna("").tolist(), batch_size=batch_size)
-        df["label"]      = [r["label"]      for r in results]
-        df["label_name"] = [r["label_name"] for r in results]
-        df["prob_human"] = [r["prob_human"] for r in results]
-        df["prob_ai"]    = [r["prob_ai"]    for r in results]
-        df["confidence"] = [r["confidence"] for r in results]
+        if "year" not in df.columns:
+            year_from_name = csv_path.stem.split("_")[0]
+            df["year"] = year_from_name
 
-        # Per-source breakdown (if 'source' column exists)
-        sources = df["source"].unique() if "source" in df.columns else ["all"]
-        for source in sources:
-            sub = df[df["source"] == source] if "source" in df.columns else df
-            n_total  = len(sub)
-            n_ai     = (sub["label"] == 1).sum()
-            pct_human = 100 * (1 - n_ai / n_total)
-            pct_ai    = 100 * n_ai / n_total
-            mean_conf = sub["confidence"].mean() * 100
+        df = detector.predict_dataframe(df, batch_size=batch_size)
+        all_dfs.append(df)
 
-            yearly_summary.append({
-                "year":          year,
-                "source":        source,
-                "n_articles":    n_total,
-                "human_pct":     round(pct_human, 1),
-                "ai_pct":        round(pct_ai, 1),
-                "mean_conf_pct": round(mean_conf, 1),
-            })
-            logger.info(
-                f"  {year} | {source}: "
-                f"Human={pct_human:.1f}%, AI={pct_ai:.1f}%, "
-                f"ConfI={mean_conf:.1f}%"
-            )
+    if not all_dfs:
+        raise FileNotFoundError(f"No CSV files found in {input_dir}")
 
-        df.to_csv(f"{output_dir}/{csv_path.name}", index=False)
+    combined = pd.concat(all_dfs, ignore_index=True)
+    save_summaries(combined, output_dir)
+    return combined
 
-    summary_df = pd.DataFrame(yearly_summary)
-    summary_df.to_csv(f"{output_dir}/yearly_summary.csv", index=False)
-    with open(f"{output_dir}/yearly_summary.json", "w", encoding="utf-8") as f:
-        json.dump(yearly_summary, f, indent=2, ensure_ascii=False)
 
-    logger.info(f"\nYearly summary saved to {output_dir}/yearly_summary.csv")
-    print("\n" + summary_df.to_string(index=False))
-    return summary_df
+def analyze_buka_folder(
+    detector: BosnianAIDetector,
+    buka_dir: str,
+    output_dir: str,
+    batch_size: int = 16,
+    exclude_categories: set[str] | None = None,
+):
+    """
+    Run the detector directly over the buka.ba folder structure
+    (category subfolders with <***> .txt dumps). Produces the same
+    summary tables, broken down by year and category.
+    """
+    exclude = exclude_categories or {"Karikature i stripovi"}
+    base = Path(buka_dir)
+    if not base.exists():
+        raise FileNotFoundError(f"Directory not found: {base}")
+
+    all_dfs = []
+    for cat_dir in sorted(d for d in base.iterdir() if d.is_dir()):
+        if cat_dir.name in exclude:
+            logger.info(f"Skipping excluded category: {cat_dir.name}")
+            continue
+        articles = []
+        for txt in sorted(cat_dir.glob("*.txt")):
+            articles.extend(parse_dump_file(txt))
+        if not articles:
+            continue
+        df = build_dataframe(articles, label=-1)  # -1 = unknown ground truth
+        df = df.drop(columns=["label"])
+        df["category"] = cat_dir.name
+        all_dfs.append(df)
+        logger.info(f"Category '{cat_dir.name}': {len(df)} articles")
+
+    if not all_dfs:
+        raise FileNotFoundError(f"No articles parsed from {base}")
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    logger.info(f"Predicting on {len(combined)} articles...")
+    combined = detector.predict_dataframe(combined, batch_size=batch_size)
+    save_summaries(combined, output_dir)
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -174,38 +279,54 @@ if __name__ == "__main__":
     sp = subparsers.add_parser("text", help="Predict a single article")
     sp.add_argument("--text", required=True, help="Article text (in Bosnian)")
 
-    # Batch CSV
-    sp2 = subparsers.add_parser("batch", help="Predict from a CSV file")
-    sp2.add_argument("--input_csv",  required=True)
+    # Batch CSV or raw txt dump
+    sp2 = subparsers.add_parser("batch", help="Predict from a CSV file or <***> .txt dump")
+    sp2.add_argument("--input_csv",  default=None)
+    sp2.add_argument("--input_txt",  default=None, help="Raw <***> dump instead of CSV")
     sp2.add_argument("--output_csv", default="predictions.csv")
     sp2.add_argument("--text_col",   default="text")
     sp2.add_argument("--batch_size", type=int, default=16)
 
-    # Yearly analysis
+    # Yearly analysis over CSVs
     sp3 = subparsers.add_parser("yearly", help="Yearly analysis across multiple CSV files")
-    sp3.add_argument("--input_dir",  required=True, help="Dir with YYYY_*.csv files")
+    sp3.add_argument("--input_dir",  required=True, help="Dir with CSV files")
     sp3.add_argument("--output_dir", default="results/yearly")
     sp3.add_argument("--batch_size", type=int, default=16)
 
+    # Direct analysis of the buka.ba folder structure
+    sp4 = subparsers.add_parser("buka", help="Analyze the buka.ba folder structure directly")
+    sp4.add_argument("--buka_dir",   required=True, help="Path to buka.ba folder")
+    sp4.add_argument("--output_dir", default="results/buka")
+    sp4.add_argument("--batch_size", type=int, default=16)
+    sp4.add_argument("--exclude", nargs="*", default=None,
+                     help="Category folders to skip (default: 'Karikature i stripovi')")
+
     args = parser.parse_args()
-    detector = BosniakAIDetector(args.model_dir)
+    detector = BosnianAIDetector(args.model_dir)
 
     if args.mode == "text":
         result = detector.predict_single(args.text)
-        print(f"\nPrediction: {result['label_name']}")
+        print(f"\nPrediction: {result['pred_label_name']}")
         print(f"Confidence: {result['confidence']:.1%}")
         print(f"P(human)={result['prob_human']:.4f}  P(AI)={result['prob_ai']:.4f}")
 
     elif args.mode == "batch":
-        df = pd.read_csv(args.input_csv)
-        results = detector.predict(df[args.text_col].fillna("").tolist(),
-                                   batch_size=args.batch_size)
-        for key in ["label", "label_name", "prob_human", "prob_ai", "confidence"]:
-            df[key] = [r[key] for r in results]
+        if args.input_txt:
+            articles = parse_dump_file(Path(args.input_txt))
+            df = build_dataframe(articles, label=-1).drop(columns=["label"])
+        elif args.input_csv:
+            df = pd.read_csv(args.input_csv)
+        else:
+            raise SystemExit("Provide --input_csv or --input_txt")
+
+        df = detector.predict_dataframe(df, text_col=args.text_col,
+                                        batch_size=args.batch_size)
+        Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(args.output_csv, index=False)
-        n_ai = sum(r["label"] == 1 for r in results)
+        n_ai = int((df["pred_label"] == 1).sum())
         print(f"\nResults saved to {args.output_csv}")
-        print(f"AI-generated: {n_ai}/{len(results)} ({100*n_ai/len(results):.1f}%)")
+        print(f"AI-generated: {n_ai}/{len(df)} ({100*n_ai/len(df):.1f}%)")
+        print(f"Mean confidence: {df['confidence'].mean():.1%}")
 
     elif args.mode == "yearly":
         analyze_yearly_distribution(
@@ -213,6 +334,15 @@ if __name__ == "__main__":
             input_dir=args.input_dir,
             output_dir=args.output_dir,
             batch_size=args.batch_size,
+        )
+
+    elif args.mode == "buka":
+        analyze_buka_folder(
+            detector,
+            buka_dir=args.buka_dir,
+            output_dir=args.output_dir,
+            batch_size=args.batch_size,
+            exclude_categories=set(args.exclude) if args.exclude else None,
         )
 
     else:

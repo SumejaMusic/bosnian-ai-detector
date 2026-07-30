@@ -5,14 +5,22 @@ BERTić is an Electra-based model (Clark et al., 2020) trained on 8B+ tokens of
 Bosnian/Croatian/Montenegrin/Serbian text (Ljubešić & Lauc, 2021).
 For classification we use ElectraForSequenceClassification via AutoModel.
 
+Compatible with both older (v4.x) and newer (v4.46+/v5.x) transformers:
+  - evaluation_strategy → eval_strategy
+  - Trainer(tokenizer=...) → Trainer(processing_class=...)
+  - no set_format("torch")  (avoids torchvision VideoReader import conflict;
+    DataCollatorWithPadding returns tensors anyway)
+
 Run:
     python train.py
     python train.py --output_dir output/run1 --num_epochs 6 --seed 42
 """
 
 import json
+import inspect
 import logging
 import argparse
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +46,37 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Version compatibility helpers
+# ---------------------------------------------------------------------------
+_TRAINING_ARGS_PARAMS = set(inspect.signature(TrainingArguments.__init__).parameters)
+_TRAINER_PARAMS       = set(inspect.signature(Trainer.__init__).parameters)
+
+
+def make_training_args(**kwargs) -> TrainingArguments:
+    """
+    Build TrainingArguments across transformers versions.
+    Pass 'eval_strategy' — it is renamed to 'evaluation_strategy'
+    automatically if running on an older transformers version.
+    """
+    if "eval_strategy" in kwargs and "eval_strategy" not in _TRAINING_ARGS_PARAMS:
+        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
+    return TrainingArguments(**kwargs)
+
+
+def make_trainer(tokenizer=None, **kwargs) -> Trainer:
+    """
+    Build Trainer across transformers versions.
+    Newer versions use processing_class=, older use tokenizer=.
+    """
+    if tokenizer is not None:
+        if "processing_class" in _TRAINER_PARAMS:
+            kwargs["processing_class"] = tokenizer
+        else:
+            kwargs["tokenizer"] = tokenizer
+    return Trainer(**kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Dataset loading
 # ---------------------------------------------------------------------------
 def load_splits(data_dir: str) -> DatasetDict:
@@ -46,12 +85,15 @@ def load_splits(data_dir: str) -> DatasetDict:
     test  = pd.read_csv(f"{data_dir}/test.csv")
 
     for df, name in [(train, "train"), (val, "val"), (test, "test")]:
+        # Drop rows with missing text/label to avoid tokenizer crashes
+        df.dropna(subset=["text", "label"], inplace=True)
+        df["label"] = df["label"].astype(int)
         logger.info(f"{name}: {len(df)} rows, class dist: {df['label'].value_counts().to_dict()}")
 
     return DatasetDict({
-        "train": Dataset.from_pandas(train[["text", "label"]]),
-        "val":   Dataset.from_pandas(val[["text", "label"]]),
-        "test":  Dataset.from_pandas(test[["text", "label"]]),
+        "train": Dataset.from_pandas(train[["text", "label"]], preserve_index=False),
+        "val":   Dataset.from_pandas(val[["text", "label"]],   preserve_index=False),
+        "test":  Dataset.from_pandas(test[["text", "label"]],  preserve_index=False),
     })
 
 
@@ -120,7 +162,9 @@ def train_single_run(
     tokenize_fn = make_tokenize_fn(tokenizer, max_length)
     tokenized = raw_datasets.map(tokenize_fn, batched=True, remove_columns=["text"])
     tokenized = tokenized.rename_column("label", "labels")
-    tokenized.set_format("torch")
+    # NOTE: no set_format("torch") here — it triggers a torchvision
+    # VideoReader import conflict on Colab, and DataCollatorWithPadding
+    # already converts batches to tensors.
 
     # 3. Model  —  ElectraForSequenceClassification under the hood
     logger.info(f"Loading model: {model_name}")
@@ -129,11 +173,10 @@ def train_single_run(
         num_labels=2,
         hidden_dropout_prob=0.2,
         attention_probs_dropout_prob=0.2,
-        ignore_mismatched_sizes=True,
     )
 
-    # 4. Training arguments
-    training_args = TrainingArguments(
+    # 4. Training arguments (eval_strategy auto-renamed on old versions)
+    training_args = make_training_args(
         output_dir=run_output,
         num_train_epochs=num_epochs,
         per_device_train_batch_size=batch_size,
@@ -144,7 +187,7 @@ def train_single_run(
         warmup_ratio=warmup_ratio,
         max_grad_norm=1.0,
         label_smoothing_factor=label_smoothing,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="eval_f1",
@@ -157,13 +200,13 @@ def train_single_run(
         dataloader_num_workers=0,
     )
 
-    # 5. Trainer
-    trainer = Trainer(
+    # 5. Trainer (processing_class= on new versions, tokenizer= on old)
+    trainer = make_trainer(
+        tokenizer=tokenizer,
         model=model,
         args=training_args,
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["val"],
-        tokenizer=tokenizer,
         data_collator=DataCollatorWithPadding(tokenizer),
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
@@ -207,6 +250,10 @@ def train_single_run(
     trainer.save_model(f"{run_output}/best_model")
     tokenizer.save_pretrained(f"{run_output}/best_model")
 
+    # Free GPU memory between runs (important on Colab T4)
+    del trainer, model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
     return results
 
 
@@ -217,11 +264,13 @@ def train_multiple_runs(
     data_dir: str,
     output_dir: str,
     num_runs: int = 5,
+    seed: int = 42,
     **kwargs,
 ) -> dict:
+    base_seed = seed
     all_results = []
     for i in range(1, num_runs + 1):
-        run_seed = kwargs.pop("seed", 42) + i - 1
+        run_seed = base_seed + i - 1          # seeds: 42, 43, 44, 45, 46
         results = train_single_run(
             run_id=i,
             data_dir=data_dir,
@@ -230,7 +279,6 @@ def train_multiple_runs(
             **kwargs,
         )
         all_results.append(results)
-        kwargs["seed"] = run_seed  # restore for next pop
 
     # Aggregate
     metrics = ["accuracy", "f1", "precision", "recall"]
@@ -259,7 +307,6 @@ def train_multiple_runs(
     best_run = max(all_results, key=lambda r: r["f1"])
     best_run_dir = f"{output_dir}/run_{best_run['run_id']}/best_model"
     final_model_dir = f"{output_dir}/final_model"
-    import shutil
     if Path(final_model_dir).exists():
         shutil.rmtree(final_model_dir)
     shutil.copytree(best_run_dir, final_model_dir)
@@ -293,6 +340,7 @@ if __name__ == "__main__":
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         num_runs=args.num_runs,
+        seed=args.seed,
         model_name=args.model_name,
         max_length=args.max_length,
         num_epochs=args.num_epochs,
@@ -303,7 +351,6 @@ if __name__ == "__main__":
         warmup_ratio=args.warmup_ratio,
         label_smoothing=args.label_smooth,
         fp16=args.fp16,
-        seed=args.seed,
     )
 
     print("\nFinal summary:")

@@ -80,6 +80,16 @@ def make_trainer(tokenizer=None, **kwargs) -> Trainer:
 # Dataset loading
 # ---------------------------------------------------------------------------
 def load_splits(data_dir: str) -> DatasetDict:
+    expected = [f"{data_dir}/train.csv", f"{data_dir}/val.csv", f"{data_dir}/test.csv"]
+    missing = [p for p in expected if not Path(p).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing processed splits: {missing}\n"
+            "Run data preparation first (it combines human + AI articles):\n"
+            "    python data_preparation.py --input_dir data/raw --output_dir data/processed\n"
+            "or pass --raw_dir data/raw to train.py to run it automatically."
+        )
+
     train = pd.read_csv(f"{data_dir}/train.csv")
     val   = pd.read_csv(f"{data_dir}/val.csv")
     test  = pd.read_csv(f"{data_dir}/test.csv")
@@ -321,6 +331,9 @@ def train_multiple_runs(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fine-tune BERTić for Bosnian AI text detection")
     parser.add_argument("--data_dir",      default=cfg.data.processed_data_dir)
+    parser.add_argument("--raw_dir",       default=None,
+                        help="If given, run data_preparation on this dir first "
+                             "(combines human + AI CSVs into train/val/test splits)")
     parser.add_argument("--output_dir",    default=cfg.training.output_dir)
     parser.add_argument("--model_name",    default=cfg.model.model_name)
     parser.add_argument("--max_length",    type=int,   default=cfg.model.max_length)
@@ -335,6 +348,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_runs",      type=int,   default=cfg.training.num_train_runs)
     parser.add_argument("--seed",          type=int,   default=cfg.training.seed)
     args = parser.parse_args()
+
+    if args.raw_dir:
+        from data_preparation import prepare_dataset
+        logger.info(f"Preparing dataset from {args.raw_dir} → {args.data_dir}")
+        prepare_dataset(input_dir=args.raw_dir, output_dir=args.data_dir)
 
     summary = train_multiple_runs(
         data_dir=args.data_dir,

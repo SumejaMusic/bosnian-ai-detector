@@ -46,9 +46,10 @@ logger = logging.getLogger(__name__)
 ARTICLE_DELIMITER = re.compile(r"^\s*<\*{3}>\s*$", re.MULTILINE)
 
 # Metadata fields that appear in the header block
+# (Dnevni Avaz uses NOVINA/STRANA; buka.ba uses PORTAL/LINK)
 METADATA_KEYS = {
-    "NOVINA", "DATUM", "RUBRIKA", "NADNASLOV", "NASLOV",
-    "PODNASLOV", "STRANA", "AUTOR(I)", "AUTORI", "AUTOR",
+    "NOVINA", "PORTAL", "DATUM", "RUBRIKA", "NADNASLOV", "NASLOV",
+    "PODNASLOV", "STRANA", "AUTOR(I)", "AUTORI", "AUTOR", "LINK",
 }
 
 # A metadata line looks like  "KEY: value"
@@ -110,8 +111,9 @@ def parse_article_block(block: str) -> dict | None:
         return None
 
     return {
-        "source_name": meta.get("NOVINA", ""),
+        "source_name": meta.get("NOVINA") or meta.get("PORTAL", ""),
         "date":        meta.get("DATUM", ""),
+        "link":        meta.get("LINK", ""),
         "section":     meta.get("RUBRIKA", ""),
         "supertitle":  meta.get("NADNASLOV", ""),
         "title":       meta.get("NASLOV", ""),
@@ -160,6 +162,7 @@ def build_dataframe(
             "year":   parse_year(a["date"]),
             "title":  a["title"],
             "date":   a["date"],
+            "link":   a.get("link", ""),
         })
 
     df = pd.DataFrame(rows)
@@ -188,7 +191,7 @@ def parse_input(input_path: str, label: int, include_title: bool) -> pd.DataFram
         ai_era = df[df["year"] >= 2023]
         if len(ai_era):
             logger.warning(
-                f" {len(ai_era)}/{len(df)} articles labeled HUMAN are from year >= 2023. "
+                f"⚠️  {len(ai_era)}/{len(df)} articles labeled HUMAN are from year >= 2023. "
                 "These may already contain AI-assisted writing and can contaminate "
                 "the human class. Consider using pre-2023 articles for training, "
                 "and keeping 2023+ articles for external validation (predict.py) instead."

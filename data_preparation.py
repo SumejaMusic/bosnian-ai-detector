@@ -119,7 +119,7 @@ def rewrite_with_chatgpt(
 
 # Metadata header lines that may leak into text if a dump was pasted into a CSV
 METADATA_HEADER_RE = re.compile(
-    r"^(NOVINA|DATUM|RUBRIKA|NADNASLOV|NASLOV|PODNASLOV|STRANA|AUTOR\(I\)|AUTORI|AUTOR)\s*:.*$",
+    r"^(NOVINA|PORTAL|DATUM|RUBRIKA|NADNASLOV|NASLOV|PODNASLOV|STRANA|AUTOR\(I\)|AUTORI|AUTOR|LINK)\s*:.*$",
     re.MULTILINE,
 )
 DELIMITER_RE = re.compile(r"<\*{3}>")

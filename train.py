@@ -200,8 +200,14 @@ def train_single_run(
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
-        metric_for_best_model="eval_f1",
-        greater_is_better=True,
+        # Prepravka za 2. trening: eval loss po epohama bio je
+        # 0.657 -> 0.527 -> 0.721 -> 0.917 (minimum u 2. epohi), a F1 se zna
+        # popravljati i nakon što loss krene rasti jer model postaje presiguran.
+        # Izbor po F1 zato bira kasniju, presigurnu epohu (histogram: AI stub u 1.0,
+        # pristranost prema AI klasi). Loss bira bolje kalibrisan model.
+        # Staro: metric_for_best_model="eval_f1", greater_is_better=True
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         save_total_limit=2,
         fp16=fp16 and torch.cuda.is_available(),
         seed=seed,
@@ -219,7 +225,10 @@ def train_single_run(
         eval_dataset=tokenized["val"],
         data_collator=DataCollatorWithPadding(tokenizer),
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+        # Patience 2 (uz eval po epohi) presijecao je runove prerano na malom,
+        # šumnom datasetu i doprinosio varijansi 74.6–88.9% među runovima.
+        # Staro: early_stopping_patience=2
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
 
     # 6. Train

@@ -7,13 +7,14 @@ For classification we use ElectraForSequenceClassification via AutoModel.
 
 Compatible with both older (v4.x) and newer (v4.46+/v5.x) transformers:
   - evaluation_strategy → eval_strategy
+  - warmup_ratio → warmup_steps (float < 1) on v5
   - Trainer(tokenizer=...) → Trainer(processing_class=...)
   - no set_format("torch")  (avoids torchvision VideoReader import conflict;
     DataCollatorWithPadding returns tensors anyway)
 
 Run:
     python train.py
-    python train.py --output_dir output/run1 --num_epochs 6 --seed 42
+    python train.py --output_dir output/model3 --num_epochs 3 --eval_steps 50 --patience 5
 """
 
 import json
@@ -58,6 +59,7 @@ def make_training_args(**kwargs) -> TrainingArguments:
     - 'eval_strategy' is renamed to 'evaluation_strategy' on older versions.
     - 'warmup_ratio' was removed in transformers v5; there 'warmup_steps'
       accepts a float < 1, interpreted as a fraction of total training steps.
+    - 'save_only_model' is dropped on versions that do not support it.
     """
     if "eval_strategy" in kwargs and "eval_strategy" not in _TRAINING_ARGS_PARAMS:
         kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
@@ -67,7 +69,11 @@ def make_training_args(**kwargs) -> TrainingArguments:
         if ratio and not kwargs.get("warmup_steps"):
             kwargs["warmup_steps"] = ratio
 
+    if "save_only_model" in kwargs and "save_only_model" not in _TRAINING_ARGS_PARAMS:
+        kwargs.pop("save_only_model")
+
     return TrainingArguments(**kwargs)
+
 
 def make_trainer(tokenizer=None, **kwargs) -> Trainer:
     """
@@ -141,6 +147,14 @@ def compute_metrics(eval_pred):
     }
 
 
+def _step_from_checkpoint(path) -> int:
+    """'.../checkpoint-200' → 200 (or -1 if unknown)."""
+    try:
+        return int(str(path).rstrip("/").split("-")[-1])
+    except (ValueError, AttributeError):
+        return -1
+
+
 # ---------------------------------------------------------------------------
 # Single training run
 # ---------------------------------------------------------------------------
@@ -158,6 +172,8 @@ def train_single_run(
     warmup_ratio: float,
     label_smoothing: float,
     fp16: bool,
+    eval_steps: int,
+    patience: int,
     seed: int,
 ) -> dict:
     """Run one complete training + evaluation cycle."""
@@ -191,7 +207,7 @@ def train_single_run(
         attention_probs_dropout_prob=0.2,
     )
 
-    # 4. Training arguments (eval_strategy auto-renamed on old versions)
+    # 4. Training arguments
     training_args = make_training_args(
         output_dir=run_output,
         num_train_epochs=num_epochs,
@@ -203,21 +219,27 @@ def train_single_run(
         warmup_ratio=warmup_ratio,
         max_grad_norm=1.0,
         label_smoothing_factor=label_smoothing,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        # Prepravka za 3. trening: u 2. treningu minimum eval lossa bio je uvijek
+        # u 1. epohi (~236 koraka), a u 1. treningu oko koraka 260. Evaluacija po
+        # epohi je pregruba — u runu 5 epoha 1 i 3 imale su loss 0.6406 vs 0.6407,
+        # a tačnost 0.697 vs 0.780. Evaluacija na svakih `eval_steps` koraka
+        # pronalazi stvarni minimum.
+        # Staro: eval_strategy="epoch", save_strategy="epoch"
+        eval_strategy="steps",
+        eval_steps=eval_steps,
+        save_strategy="steps",
+        save_steps=eval_steps,          # mora biti jednako eval_steps zbog load_best_model_at_end
+        save_only_model=True,           # bez optimizer stanja: ~440MB umjesto ~1.3GB po checkpointu
         load_best_model_at_end=True,
-        # Prepravka za 2. trening: eval loss po epohama bio je
-        # 0.657 -> 0.527 -> 0.721 -> 0.917 (minimum u 2. epohi), a F1 se zna
-        # popravljati i nakon što loss krene rasti jer model postaje presiguran.
-        # Izbor po F1 zato bira kasniju, presigurnu epohu (histogram: AI stub u 1.0,
-        # pristranost prema AI klasi). Loss bira bolje kalibrisan model.
-        # Staro: metric_for_best_model="eval_f1", greater_is_better=True
+        # Izbor po eval_loss (ne po F1): F1 se zna popravljati i nakon što loss
+        # krene rasti jer model postaje presiguran, pa izbor po F1 bira kasniju,
+        # lošije kalibrisanu tačku (pristranost prema AI klasi).
         metric_for_best_model="eval_loss",
         greater_is_better=False,
-        save_total_limit=2,
+        save_total_limit=2,             # Trainer uvijek čuva i najbolji checkpoint
         fp16=fp16 and torch.cuda.is_available(),
         seed=seed,
-        logging_steps=50,
+        logging_steps=eval_steps,
         report_to="none",
         dataloader_num_workers=0,
     )
@@ -231,32 +253,41 @@ def train_single_run(
         eval_dataset=tokenized["val"],
         data_collator=DataCollatorWithPadding(tokenizer),
         compute_metrics=compute_metrics,
-        # Patience 2 (uz eval po epohi) presijecao je runove prerano na malom,
-        # šumnom datasetu i doprinosio varijansi 74.6–88.9% među runovima.
-        # Staro: early_stopping_patience=2
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+        # Patience se sada broji u evaluacijama (svakih eval_steps koraka):
+        # 5 × 50 = 250 koraka bez poboljšanja eval lossa → stop.
+        # Staro: early_stopping_patience=3 (u epohama)
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=patience)],
     )
 
     # 6. Train
     trainer.train()
 
-    # 7. Evaluate on test set
+    best_val_loss = trainer.state.best_metric
+    best_step = _step_from_checkpoint(trainer.state.best_model_checkpoint)
+    logger.info(f"Run {run_id}: best eval_loss={best_val_loss:.4f} at step {best_step}")
+
+    # 7. Evaluate on test set (best checkpoint is already loaded)
     test_results = trainer.predict(tokenized["test"])
     preds = np.argmax(test_results.predictions, axis=-1)
     labels = test_results.label_ids
 
+    report = classification_report(
+        labels, preds,
+        target_names=["Human-written", "AI-generated"],
+        output_dict=True,
+    )
     results = {
         "run_id": run_id,
         "seed": seed,
+        "best_val_loss": float(best_val_loss),
+        "best_step": best_step,
         "accuracy":  float(accuracy_score(labels, preds)),
         "f1":        float(f1_score(labels, preds, average="macro")),
         "precision": float(precision_score(labels, preds, average="macro")),
         "recall":    float(recall_score(labels, preds, average="macro")),
-        "report":    classification_report(
-            labels, preds,
-            target_names=["Human-written", "AI-generated"],
-            output_dict=True,
-        ),
+        "human_recall": float(report["Human-written"]["recall"]),
+        "ai_recall":    float(report["AI-generated"]["recall"]),
+        "report":    report,
     }
 
     logger.info(
@@ -264,7 +295,9 @@ def train_single_run(
         f"Accuracy: {results['accuracy']:.4f}, "
         f"F1: {results['f1']:.4f}, "
         f"Precision: {results['precision']:.4f}, "
-        f"Recall: {results['recall']:.4f}"
+        f"Recall: {results['recall']:.4f} | "
+        f"Human recall: {results['human_recall']:.4f}, "
+        f"AI recall: {results['ai_recall']:.4f}"
     )
 
     # Save per-run results
@@ -306,7 +339,7 @@ def train_multiple_runs(
         all_results.append(results)
 
     # Aggregate
-    metrics = ["accuracy", "f1", "precision", "recall"]
+    metrics = ["accuracy", "f1", "precision", "recall", "human_recall", "ai_recall", "best_val_loss"]
     summary = {}
     for m in metrics:
         vals = [r[m] for r in all_results]
@@ -317,25 +350,40 @@ def train_multiple_runs(
             "max":  float(np.max(vals)),
             "per_run": vals,
         }
+    summary["best_step"] = {"per_run": [r["best_step"] for r in all_results]}
 
     logger.info("\n" + "="*60)
     logger.info("FINAL RESULTS (mean ± std across runs):")
     for m in metrics:
         s = summary[m]
-        logger.info(f"  {m:<12} {s['mean']:.4f} ± {s['std']:.4f}")
+        logger.info(f"  {m:<14} {s['mean']:.4f} ± {s['std']:.4f}")
+    logger.info(f"  best steps     {summary['best_step']['per_run']}")
     logger.info("="*60)
+
+    # Final model = run with the lowest VALIDATION loss.
+    # (Ranije: najbolji test F1 — to koristi test skup za izbor modela i daje
+    #  optimističnu procjenu. Test skup se koristi samo za izvještavanje.)
+    best_run = min(all_results, key=lambda r: r["best_val_loss"])
+    summary["final_model"] = {
+        "selected_by": "lowest best_val_loss",
+        "run_id": best_run["run_id"],
+        "best_val_loss": best_run["best_val_loss"],
+        "test_f1": best_run["f1"],
+        "test_accuracy": best_run["accuracy"],
+    }
 
     with open(f"{output_dir}/summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    # Identify best run by F1 and copy its model as "final_model"
-    best_run = max(all_results, key=lambda r: r["f1"])
     best_run_dir = f"{output_dir}/run_{best_run['run_id']}/best_model"
     final_model_dir = f"{output_dir}/final_model"
     if Path(final_model_dir).exists():
         shutil.rmtree(final_model_dir)
     shutil.copytree(best_run_dir, final_model_dir)
-    logger.info(f"Best model (run {best_run['run_id']}, F1={best_run['f1']:.4f}) → {final_model_dir}")
+    logger.info(
+        f"Final model (run {best_run['run_id']}, val loss={best_run['best_val_loss']:.4f}, "
+        f"test F1={best_run['f1']:.4f}) → {final_model_dir}"
+    )
 
     return summary
 
@@ -360,6 +408,10 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_ratio",  type=float, default=cfg.training.warmup_ratio)
     parser.add_argument("--label_smooth",  type=float, default=cfg.training.label_smoothing_factor)
     parser.add_argument("--fp16",          action="store_true", default=cfg.training.fp16)
+    parser.add_argument("--eval_steps",    type=int,   default=50,
+                        help="Evaluate and save a checkpoint every N optimizer steps")
+    parser.add_argument("--patience",      type=int,   default=5,
+                        help="Early stopping patience, counted in evaluations")
     parser.add_argument("--num_runs",      type=int,   default=cfg.training.num_train_runs)
     parser.add_argument("--seed",          type=int,   default=cfg.training.seed)
     args = parser.parse_args()
@@ -384,7 +436,13 @@ if __name__ == "__main__":
         warmup_ratio=args.warmup_ratio,
         label_smoothing=args.label_smooth,
         fp16=args.fp16,
+        eval_steps=args.eval_steps,
+        patience=args.patience,
     )
 
     print("\nFinal summary:")
-    print(json.dumps({k: {"mean": v["mean"], "std": v["std"]} for k, v in summary.items()}, indent=2))
+    print(json.dumps(
+        {k: {"mean": v["mean"], "std": v["std"]} for k, v in summary.items() if "mean" in v},
+        indent=2,
+    ))
+    print(json.dumps(summary["final_model"], indent=2))

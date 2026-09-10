@@ -55,13 +55,19 @@ _TRAINER_PARAMS       = set(inspect.signature(Trainer.__init__).parameters)
 def make_training_args(**kwargs) -> TrainingArguments:
     """
     Build TrainingArguments across transformers versions.
-    Pass 'eval_strategy' — it is renamed to 'evaluation_strategy'
-    automatically if running on an older transformers version.
+    - 'eval_strategy' is renamed to 'evaluation_strategy' on older versions.
+    - 'warmup_ratio' was removed in transformers v5; there 'warmup_steps'
+      accepts a float < 1, interpreted as a fraction of total training steps.
     """
     if "eval_strategy" in kwargs and "eval_strategy" not in _TRAINING_ARGS_PARAMS:
         kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
-    return TrainingArguments(**kwargs)
 
+    if "warmup_ratio" in kwargs and "warmup_ratio" not in _TRAINING_ARGS_PARAMS:
+        ratio = kwargs.pop("warmup_ratio")
+        if ratio and not kwargs.get("warmup_steps"):
+            kwargs["warmup_steps"] = ratio
+
+    return TrainingArguments(**kwargs)
 
 def make_trainer(tokenizer=None, **kwargs) -> Trainer:
     """
